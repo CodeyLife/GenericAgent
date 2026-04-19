@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-GenericAgent MCP Bridge - 多项目记忆隔离版本
-让 Trae 的自带模型驱动，GenericAgent 只提供工具执行能力
-支持项目级记忆隔离
-
+GenericAgent MCP Bridge - 让 Trae 的自带模型驱动，GenericAgent 只提供工具执行能力
 放置: GenericAgent/mcp_bridge_isolated.py
 用法: 在 Trae 的 MCP 配置中引用此文件
 """
@@ -38,13 +35,12 @@ from mcp.server.models import InitializationOptions
 # 导入 GenericAgent 工具模块（无 LLM）
 from ga import (
     execute_code,
-    web_scan, web_execute_js, ask_user
+    web_scan, web_execute_js, ask_user,
+    file_read as ga_file_read,
+    file_patch as ga_file_patch,
+    expand_file_refs,
 )
 
-# 导入项目上下文管理（实现记忆隔离）
-from memory.project_context import (
-    ProjectContextManager, list_projects
-)
 
 # 导入 GenericAgent 的扩展能力
 with redirect_stdout(io.StringIO()):
@@ -93,6 +89,9 @@ with redirect_stdout(io.StringIO()):
 
 # 获取所有 SOP 文件
 SOP_DIR = os.path.join(script_dir, 'memory')
+WORKING_CHECKPOINT: Dict[str, Any] = {}
+
+
 def get_all_sops():
     """获取所有 SOP 文件列表"""
     sops = []
@@ -107,6 +106,39 @@ def get_all_sops():
     except:
         pass
     return sops
+
+
+def resolve_workspace_path(path: str, cwd: str) -> Path:
+    """Resolve a user path against request cwd, matching ga.py relative-path behavior."""
+    if not path:
+        raise ValueError("path 不能为空")
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    return candidate.resolve()
+
+
+def write_file_content(path: Path, content: str, *, mode: str = "overwrite") -> Dict[str, Any]:
+    """MCP version of ga.py file_write: use patch for precise edits; write for large content."""
+    if mode not in ("overwrite", "append", "prepend"):
+        raise ValueError("mode 必须是 overwrite/append/prepend")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "prepend":
+        old = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        path.write_text(content + old, encoding="utf-8")
+    elif mode == "append":
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(content)
+    else:
+        path.write_text(content, encoding="utf-8")
+    return {"status": "success", "path": str(path), "mode": mode, "written_bytes": len(content)}
+
+
+def load_memory_management_sop() -> str:
+    path = Path(SOP_DIR) / "memory_management_sop.md"
+    if not path.exists():
+        return "Memory Management SOP not found. Do not update memory."
+    return read_text_if_exists(path)
 
 
 def screenshot_to_base64() -> str:
@@ -126,7 +158,7 @@ def get_window_list() -> List[Dict]:
     try:
         import win32gui
         windows = []
-        
+
         def callback(hwnd, extra):
             if win32gui.IsWindowVisible(hwnd):
                 title = win32gui.GetWindowText(hwnd)
@@ -139,7 +171,7 @@ def get_window_list() -> List[Dict]:
                         "width": rect[2] - rect[0],
                         "height": rect[3] - rect[1]
                     })
-        
+
         win32gui.EnumWindows(callback, None)
         return windows
     except Exception as e:
@@ -159,7 +191,7 @@ def activate_window(hwnd: int) -> dict:
 @dataclass
 class AppContext:
     """应用上下文"""
-    project_manager: ProjectContextManager
+    pass
 
 
 def _file_uri_to_path(uri: str) -> Optional[str]:
@@ -206,33 +238,10 @@ async def resolve_request_cwd(app_ctx: Any) -> str:
     return str(Path.cwd().resolve())
 
 
-def extract_project_manager(lifespan_context: Any) -> ProjectContextManager:
-    """兼容不同 lifespan_context 形态，提取项目管理器"""
-    if isinstance(lifespan_context, AppContext):
-        return lifespan_context.project_manager
-
-    if isinstance(lifespan_context, ProjectContextManager):
-        return lifespan_context
-
-    if isinstance(lifespan_context, dict):
-        manager = lifespan_context.get("project_manager")
-        if isinstance(manager, ProjectContextManager):
-            return manager
-
-    manager = getattr(lifespan_context, "project_manager", None)
-    if isinstance(manager, ProjectContextManager):
-        return manager
-
-    return ProjectContextManager()
-
-
-async def get_request_project_context() -> tuple[ProjectContextManager, str, Any]:
-    """获取与当前请求绑定的项目上下文"""
+async def get_request_cwd() -> str:
+    """获取与当前请求绑定的工作目录。"""
     request_ctx = server.request_context
-    project_manager = extract_project_manager(request_ctx.lifespan_context)
-    request_cwd = await resolve_request_cwd(request_ctx.lifespan_context)
-    project_ctx = project_manager.detect_project(cwd=request_cwd)
-    return project_manager, request_cwd, project_ctx
+    return await resolve_request_cwd(request_ctx.lifespan_context)
 
 
 SAFE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -318,6 +327,198 @@ def error_result(message: str, **data: Any) -> CallToolResult:
         isError=True,
     )
 
+ORIGINAL_MEMORY_TYPES = (
+    "all",
+    "global_mem_insight",
+    "global_mem",
+    "todo",
+    "history",
+    "l3_index",
+    "l4_index",
+    "memory_management_sop",
+)
+
+
+def original_memory_paths(base_dir: Optional[Path] = None) -> Dict[str, Path]:
+    """返回原 GenericAgent 四级记忆路径。"""
+    root = base_dir or Path(script_dir)
+    return {
+        "l1": root / "memory" / "global_mem_insight.txt",
+        "l2": root / "memory" / "global_mem.txt",
+        "l3": root / "memory",
+        "l4": root / "memory" / "L4_raw_sessions",
+        "todo": root / "temp" / "TODO.txt",
+        "history": root / "temp" / "autonomous_reports" / "history.txt",
+        "scheduler": root / "sche_tasks",
+        "memory_management_sop": root / "memory" / "memory_management_sop.md",
+    }
+
+
+def read_text_if_exists(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def list_memory_entries(path: Path, *, recursive: bool = False) -> List[Dict[str, Any]]:
+    """列出 L3/L4 记忆条目，避免一次性读取大量内容。"""
+    if not path.exists() or not path.is_dir():
+        return []
+
+    iterator = path.rglob("*") if recursive else path.iterdir()
+    entries = []
+    for item in iterator:
+        if not item.is_file():
+            continue
+        rel = item.relative_to(path)
+        if "__pycache__" in rel.parts:
+            continue
+        entries.append({
+            "name": item.name,
+            "relative_path": str(rel),
+            "size": item.stat().st_size,
+        })
+    return sorted(entries, key=lambda x: x["relative_path"])
+
+
+def read_original_memory(memory_type: str = "all") -> Dict[str, Any]:
+    """按原项目 L1/L2/L3/L4 记忆模型读取。"""
+    if memory_type not in ORIGINAL_MEMORY_TYPES:
+        raise ValueError(f"memory_type 必须是 {', '.join(ORIGINAL_MEMORY_TYPES)}")
+
+    paths = original_memory_paths()
+    layers: Dict[str, Any] = {}
+
+    if memory_type in ("all", "global_mem_insight"):
+        layers["L1_global_mem_insight"] = {
+            "path": str(paths["l1"]),
+            "content": read_text_if_exists(paths["l1"]),
+        }
+    if memory_type in ("all", "global_mem"):
+        layers["L2_global_mem"] = {
+            "path": str(paths["l2"]),
+            "content": read_text_if_exists(paths["l2"]),
+        }
+    if memory_type in ("all", "l3_index"):
+        layers["L3_memory_index"] = {
+            "path": str(paths["l3"]),
+            "entries": list_memory_entries(paths["l3"]),
+        }
+    if memory_type in ("all", "l4_index"):
+        layers["L4_raw_sessions_index"] = {
+            "path": str(paths["l4"]),
+            "entries": list_memory_entries(paths["l4"], recursive=True),
+        }
+    if memory_type == "todo":
+        layers["todo"] = {
+            "path": str(paths["todo"]),
+            "content": read_text_if_exists(paths["todo"]),
+        }
+    if memory_type == "history":
+        layers["history"] = {
+            "path": str(paths["history"]),
+            "content": read_text_if_exists(paths["history"]),
+        }
+    if memory_type == "memory_management_sop":
+        layers["memory_management_sop"] = {
+            "path": str(paths["memory_management_sop"]),
+            "content": read_text_if_exists(paths["memory_management_sop"]),
+        }
+
+    return {
+        "memory_model": "original_four_level",
+        "layers": layers,
+    }
+
+
+def resolve_original_memory_write_path(memory_type: str, target_path: str = "") -> Path:
+    """解析原四级记忆写入目标；target_path 仅允许指向 memory/ 下的相对路径。"""
+    paths = original_memory_paths()
+    path_map = {
+        "global_mem_insight": paths["l1"],
+        "global_mem": paths["l2"],
+        "todo": paths["todo"],
+        "history": paths["history"],
+        "memory_management_sop": paths["memory_management_sop"],
+    }
+    if memory_type == "l3_file":
+        if not target_path:
+            raise ValueError("memory_type=l3_file 时必须提供 target_path")
+        rel = Path(target_path)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError("target_path 必须是 memory/ 内的安全相对路径")
+        resolved = (paths["l3"] / rel).resolve()
+        memory_root = paths["l3"].resolve()
+        try:
+            resolved.relative_to(memory_root)
+        except ValueError as exc:
+            raise ValueError("target_path 越界，必须位于 memory/ 目录内") from exc
+        return resolved
+    if memory_type not in path_map:
+        raise ValueError("memory_type 不支持写入；可用 global_mem_insight/global_mem/todo/history/memory_management_sop/l3_file")
+    return path_map[memory_type]
+
+
+def patch_text_file(path: Path, old_content: str, new_content: str) -> Dict[str, Any]:
+    """执行原项目风格的最小唯一 patch。"""
+    if not old_content:
+        raise ValueError("patch 模式必须提供 old_content")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"目标记忆文件不存在: {path}")
+    text = read_text_if_exists(path)
+    count = text.count(old_content)
+    if count == 0:
+        raise ValueError("未找到匹配的 old_content；请先 read_memory/read_sop 确认当前内容")
+    if count > 1:
+        raise ValueError(f"找到 {count} 处匹配，无法唯一 patch；请提供更长上下文")
+    updated = text.replace(old_content, new_content, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    return {"patched_bytes_delta": len(new_content) - len(old_content)}
+
+
+def write_original_memory(
+    memory_type: str,
+    *,
+    content: str = "",
+    mode: str = "patch",
+    old_content: str = "",
+    new_content: str = "",
+    target_path: str = "",
+) -> Dict[str, Any]:
+    """按原项目保守记忆流程写入：默认使用唯一 patch；append 需显式指定。"""
+    if mode not in ("append", "patch"):
+        raise ValueError("原项目记忆流程不支持 overwrite；仅允许 append 或 patch")
+
+    paths = original_memory_paths()
+    mem_path = resolve_original_memory_write_path(memory_type, target_path)
+    mem_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if mode == "append":
+        if memory_type not in ("global_mem", "todo", "history"):
+            raise ValueError("append 仅支持 global_mem/todo/history；L1/L3/L4 结构性修改请使用 patch")
+        stripped = content.strip()
+        if not stripped:
+            raise ValueError("content 不能为空")
+        existing = read_text_if_exists(mem_path)
+        combined = f"{existing}\n\n---\n\n{stripped}" if existing else stripped
+        with open(mem_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+        detail = {"appended_bytes": len(stripped)}
+    else:
+        detail = patch_text_file(mem_path, old_content, new_content)
+
+    return {
+        "status": "success",
+        "memory_model": "original_four_level",
+        "path": str(mem_path),
+        "memory_type": memory_type,
+        "mode": mode,
+        "sop": str(paths["memory_management_sop"]),
+        "note": "已按原项目记忆流程写入；L1/L3 同步应继续遵循 memory_management_sop 的最小 patch 原则。",
+        **detail,
+    }
 
 def resolve_scheduler_task_path(scheduler_dir: Path, task_id: str) -> Path:
     """校验 task_id 并确保任务路径不会逃逸 scheduler 目录"""
@@ -343,22 +544,6 @@ server = Server("genericagent-tools-isolated")
 async def list_tools() -> List[Tool]:
     """列出所有可用工具"""
     tools = [
-        # ===== 项目上下文工具 =====
-        Tool(
-            name="get_project_context",
-            description="获取当前项目上下文信息（自动检测当前所属项目）",
-            inputSchema={"type": "object", "properties": {}},
-            outputSchema=JSON_SCHEMA_BASE,
-            annotations=tool_annotations(title="Get Project Context", read_only=True, destructive=False, idempotent=True, open_world=False),
-        ),
-        Tool(
-            name="list_project_memories",
-            description="列出所有已存在的项目记忆空间",
-            inputSchema={"type": "object", "properties": {}},
-            outputSchema=JSON_SCHEMA_BASE,
-            annotations=tool_annotations(title="List Project Memories", read_only=True, destructive=False, idempotent=True, open_world=False),
-        ),
-        
         # ===== 基础工具 =====
         Tool(
             name="run_code",
@@ -409,30 +594,39 @@ async def list_tools() -> List[Tool]:
         #         "required": ["path", "old_string", "new_string"]
         #     }
         # ),
-        
+
         # ===== Web 工具 =====
         Tool(
             name="web_scan",
-            description="扫描浏览器页面",
+            description="扫描浏览器页面，获取当前页面的简化HTML内容和标签页列表。tabs_only=true 时仅返回标签页列表（省token）。switch_tab_id 可用于切换标签页。",
             inputSchema={
                 "type": "object",
-                "properties": {"text_only": {"type": "boolean", "default": False}}
+                "properties": {
+                    "tabs_only": {"type": "boolean", "default": False, "description": "仅返回标签页列表，不获取HTML内容"},
+                    "switch_tab_id": {"type": "string", "description": "切换到此标签页ID后再扫描"},
+                    "text_only": {"type": "boolean", "default": False, "description": "仅返回文本内容，过滤HTML标签"}
+                }
             },
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="Scan Web Page", read_only=True, destructive=False, idempotent=True, open_world=True),
         ),
         Tool(
             name="web_execute_js",
-            description="在浏览器执行 JavaScript",
+            description="在浏览器执行 JavaScript。支持 save_to_file 保存完整结果到文件，switch_tab_id 切换标签页，no_monitor 禁用执行监控。",
             inputSchema={
                 "type": "object",
-                "properties": {"script": {"type": "string"}},
+                "properties": {
+                    "script": {"type": "string", "description": "JavaScript 代码，也支持 ```javascript 代码块"},
+                    "save_to_file": {"type": "string", "description": "将 js_return 完整内容保存到此文件路径"},
+                    "switch_tab_id": {"type": "string", "description": "切换到此标签页ID后再执行"},
+                    "no_monitor": {"type": "boolean", "default": False, "description": "禁用执行监控"}
+                },
                 "required": ["script"]
             },
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="Execute Web JavaScript", read_only=False, destructive=True, idempotent=False, open_world=True),
         ),
-        
+
         # ===== 交互工具 =====
         Tool(
             name="ask_user",
@@ -448,7 +642,56 @@ async def list_tools() -> List[Tool]:
             outputSchema=ASK_USER_OUTPUT_SCHEMA,
             annotations=tool_annotations(title="Ask User", read_only=True, destructive=False, idempotent=True, open_world=True),
         ),
-        
+
+        # ===== 文件工具（对齐 ga.py） =====
+        Tool(
+            name="read_file",
+            description="读取文件内容；支持 start/count/keyword，行为对齐 ga.py file_read。读 SOP/记忆后应提取关键点到工作记忆。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径，相对 MCP roots/cwd 解析"},
+                    "start": {"type": "integer", "default": 1},
+                    "keyword": {"type": "string"},
+                    "count": {"type": "integer", "default": 200},
+                    "show_linenos": {"type": "boolean", "default": True}
+                },
+                "required": ["path"]
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Read File", read_only=True, destructive=False, idempotent=True, open_world=False),
+        ),
+        Tool(
+            name="patch_file",
+            description="唯一匹配局部修改文件；old_content 必须存在且只出现一次。精细修改优先用它，避免 overwrite。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径，相对 MCP roots/cwd 解析"},
+                    "old_content": {"type": "string"},
+                    "new_content": {"type": "string"}
+                },
+                "required": ["path", "old_content", "new_content"]
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Patch File", read_only=False, destructive=False, idempotent=False, open_world=False),
+        ),
+        Tool(
+            name="write_file",
+            description="大块写入文件；精细修改必须优先 patch_file。content 直接来自参数，不解析回复标签。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径，相对 MCP roots/cwd 解析"},
+                    "content": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["overwrite", "append", "prepend"], "default": "overwrite"}
+                },
+                "required": ["path", "content"]
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Write File", read_only=False, destructive=True, idempotent=False, open_world=False),
+        ),
+
         # ===== 截图工具 =====
         Tool(
             name="screenshot",
@@ -456,7 +699,7 @@ async def list_tools() -> List[Tool]:
             inputSchema={"type": "object", "properties": {}},
             annotations=tool_annotations(title="Take Screenshot", read_only=True, destructive=False, idempotent=True, open_world=True),
         ),
-        
+
         # ===== 窗口管理工具 =====
         Tool(
             name="list_windows",
@@ -476,7 +719,7 @@ async def list_tools() -> List[Tool]:
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="Activate Window", read_only=False, destructive=False, idempotent=False, open_world=True),
         ),
-        
+
         # ===== SOP/Skill 管理工具 =====
         Tool(
             name="list_sops",
@@ -512,16 +755,35 @@ async def list_tools() -> List[Tool]:
             outputSchema=SOP_OUTPUT_SCHEMA,
             annotations=tool_annotations(title="Describe SOP", read_only=True, destructive=False, idempotent=True, open_world=False),
         ),
-        
-        # ===== 项目隔离的记忆工具 =====
         Tool(
-            name="read_memory",
-            description="读取记忆内容（支持项目级隔离）",
+            name="update_working_checkpoint",
+            description="对齐 ga.py 的短期工作记忆：保存当前任务关键约束、发现和相关 SOP；用于长任务/切换子任务前。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "memory_type": {"type": "string", "enum": ["global_mem", "todo", "history"], "default": "global_mem"},
-                    "scope": {"type": "string", "enum": ["auto", "project", "global"], "default": "auto", "description": "读取范围：auto=自动(优先项目), project=仅项目级, global=仅全局"}
+                    "key_info": {"type": "string"},
+                    "related_sop": {"type": "string"}
+                }
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Update Working Checkpoint", read_only=False, destructive=False, idempotent=False, open_world=False),
+        ),
+        Tool(
+            name="start_long_term_update",
+            description="对齐 ga.py 的长期记忆结算入口：读取 memory_management_sop 并要求后续用 write_memory patch 做最小记忆更新。",
+            inputSchema={"type": "object", "properties": {}},
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Start Long-Term Memory Update", read_only=True, destructive=False, idempotent=True, open_world=False),
+        ),
+
+        # ===== 原项目四级记忆工具 =====
+        Tool(
+            name="read_memory",
+            description="读取原 GenericAgent 四级记忆内容（L1/L2/L3/L4）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_type": {"type": "string", "enum": list(ORIGINAL_MEMORY_TYPES), "default": "all"}
                 }
             },
             outputSchema=JSON_SCHEMA_BASE,
@@ -529,31 +791,27 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="write_memory",
-            description="写入记忆内容（支持项目级隔离）",
+            description="按原 GenericAgent 记忆流程写入：默认使用唯一 patch；append 需显式指定；不支持 overwrite",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "memory_type": {"type": "string", "enum": ["global_mem", "todo", "history"], "default": "global_mem"},
-                    "content": {"type": "string", "description": "记忆内容"},
-                    "scope": {"type": "string", "enum": ["project", "global"], "default": "project", "description": "写入范围：project=项目级, global=全局"},
-                    "mode": {"type": "string", "enum": ["append", "overwrite"], "default": "overwrite", "description": "写入模式：append=追加, overwrite=全量覆盖"}
-                },
-                "required": ["content"]
+                    "memory_type": {"type": "string", "enum": ["global_mem_insight", "global_mem", "todo", "history", "memory_management_sop", "l3_file"], "default": "global_mem"},
+                    "content": {"type": "string", "description": "append 模式追加的记忆内容"},
+                    "mode": {"type": "string", "enum": ["patch", "append"], "default": "patch", "description": "patch=唯一 old_content 替换（默认，符合原项目最小修改流程）；append=追加到 L2/todo/history"},
+                    "old_content": {"type": "string", "description": "patch 模式要替换的唯一旧文本"},
+                    "new_content": {"type": "string", "description": "patch 模式替换后的新文本"},
+                    "target_path": {"type": "string", "description": "memory_type=l3_file 时，memory/ 内的相对路径"}
+                }
             },
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="Write Memory", read_only=False, destructive=False, idempotent=False, open_world=False),
         ),
-        
-        # ===== 调度器任务管理工具（项目隔离） =====
+
+        # ===== 调度器任务管理工具 =====
         Tool(
             name="list_scheduler_tasks",
-            description="列出当前项目的调度器任务",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "include_global": {"type": "boolean", "default": False, "description": "是否包含全局任务"}
-                }
-            },
+            description="列出调度器任务",
+            inputSchema={"type": "object", "properties": {}},
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="List Scheduler Tasks", read_only=True, destructive=False, idempotent=True, open_world=False),
         ),
@@ -563,8 +821,7 @@ async def list_tools() -> List[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "任务ID"},
-                    "scope": {"type": "string", "enum": ["auto", "project", "global"], "default": "auto"}
+                    "task_id": {"type": "string", "description": "任务ID"}
                 },
                 "required": ["task_id"]
             },
@@ -573,7 +830,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="create_scheduler_task",
-            description="创建新的调度器任务（默认创建到项目空间）",
+            description="创建新的调度器任务",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -581,8 +838,7 @@ async def list_tools() -> List[Tool]:
                     "prompt": {"type": "string", "description": "任务提示词"},
                     "schedule": {"type": "string", "description": "执行时间 (如 '08:00')", "default": "08:00"},
                     "repeat": {"type": "string", "description": "重复类型 (once/daily/weekday/weekly/monthly)", "default": "daily"},
-                    "enabled": {"type": "boolean", "default": True},
-                    "scope": {"type": "string", "enum": ["project", "global"], "default": "project"}
+                    "enabled": {"type": "boolean", "default": True}
                 },
                 "required": ["task_id", "prompt"]
             },
@@ -590,7 +846,7 @@ async def list_tools() -> List[Tool]:
             annotations=tool_annotations(title="Create Scheduler Task", read_only=False, destructive=False, idempotent=False, open_world=False),
         ),
     ]
-    
+
     # ===== OCR 工具 =====
     if OCR_AVAILABLE:
         tools.append(Tool(
@@ -598,10 +854,12 @@ async def list_tools() -> List[Tool]:
             description="屏幕 OCR 文字识别",
             inputSchema={
                 "type": "object",
-                "properties": {"enhance": {"type": "boolean", "default": False}}
-            }
+                "properties": {"enhance": {"type": "boolean", "default": False, "description": "增强图像对比度以提高识别率"}}
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="OCR Screen", read_only=True, destructive=False, idempotent=True, open_world=True),
         ))
-    
+
     # ===== ADB 工具 =====
     if ADB_AVAILABLE:
         tools.extend([
@@ -611,91 +869,105 @@ async def list_tools() -> List[Tool]:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "keyword": {"type": "string"},
-                        "clickable_only": {"type": "boolean", "default": False}
+                        "keyword": {"type": "string", "description": "按文本内容过滤 UI 元素"},
+                        "clickable_only": {"type": "boolean", "default": False, "description": "仅返回可点击的元素"}
                     }
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="ADB UI Elements", read_only=True, destructive=False, idempotent=True, open_world=True),
             ),
             Tool(
                 name="adb_tap",
-                description="点击 Android 屏幕",
+                description="点击 Android 屏幕指定坐标",
                 inputSchema={
                     "type": "object",
                     "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
                     "required": ["x", "y"]
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="ADB Tap", read_only=False, destructive=True, idempotent=False, open_world=True),
             ),
         ])
-    
+
     # ===== 系统控制工具 =====
     if SYSCTL_AVAILABLE:
         tools.extend([
             Tool(
                 name="mouse_click",
-                description="鼠标点击",
+                description="鼠标点击指定坐标",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
-                        "double": {"type": "boolean", "default": False}
+                        "double": {"type": "boolean", "default": False, "description": "是否双击"}
                     },
                     "required": ["x", "y"]
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="Mouse Click", read_only=False, destructive=True, idempotent=False, open_world=True),
             ),
             Tool(
                 name="key_press",
-                description="键盘按键",
+                description="键盘按键（支持组合键，如 'ctrl+v'）",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "keys": {"type": "string", "description": "按键组合，如 'ctrl+v' 或 'enter'"}
                     },
                     "required": ["keys"]
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="Key Press", read_only=False, destructive=True, idempotent=False, open_world=True),
             ),
             Tool(
                 name="move_mouse",
-                description="移动鼠标",
+                description="移动鼠标到指定坐标",
                 inputSchema={
                     "type": "object",
                     "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
                     "required": ["x", "y"]
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="Move Mouse", read_only=False, destructive=False, idempotent=True, open_world=True),
             ),
         ])
-    
+
     # ===== UI 检测工具 =====
     if UI_DETECT_AVAILABLE:
         tools.append(Tool(
             name="detect_ui",
-            description="检测图片中的 UI 元素（YOLO）",
+            description="检测图片中的 UI 元素（YOLO 模型）",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "image_path": {"type": "string", "description": "图片路径"},
-                    "conf_threshold": {"type": "number", "default": 0.25}
+                    "conf_threshold": {"type": "number", "default": 0.25, "description": "置信度阈值 (0-1)"}
                 },
                 "required": ["image_path"]
-            }
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Detect UI Elements", read_only=True, destructive=False, idempotent=True, open_world=False),
         ))
-    
+
     # ===== 进程内存扫描工具 =====
     if PROCMEM_AVAILABLE:
         tools.append(Tool(
             name="scan_process_memory",
-            description="扫描进程内存",
+            description="扫描进程内存，搜索指定模式",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "pid": {"type": "integer", "description": "进程ID"},
                     "pattern": {"type": "string", "description": "搜索模式（字符串或十六进制）"},
-                    "mode": {"type": "string", "enum": ["auto", "hex", "text"], "default": "auto"}
+                    "mode": {"type": "string", "enum": ["auto", "hex", "text"], "default": "auto", "description": "搜索模式类型"}
                 },
                 "required": ["pid", "pattern"]
-            }
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Scan Process Memory", read_only=True, destructive=False, idempotent=True, open_world=True),
         ))
-    
+
     # ===== 技能搜索工具 =====
     if SKILL_SEARCH_AVAILABLE:
         tools.append(Tool(
@@ -706,19 +978,23 @@ async def list_tools() -> List[Tool]:
                 "properties": {
                     "query": {"type": "string", "description": "搜索关键词"},
                     "category": {"type": "string", "description": "分类过滤"},
-                    "top_k": {"type": "integer", "default": 10}
+                    "top_k": {"type": "integer", "default": 10, "description": "返回结果数量"}
                 },
                 "required": ["query"]
-            }
+            },
+            outputSchema=JSON_SCHEMA_BASE,
+            annotations=tool_annotations(title="Search Skills", read_only=True, destructive=False, idempotent=True, open_world=False),
         ))
-    
+
     # ===== 密钥管理工具 =====
     if KEYCHAIN_AVAILABLE:
         tools.extend([
             Tool(
                 name="keychain_list",
                 description="列出所有存储的密钥名称",
-                inputSchema={"type": "object", "properties": {}}
+                inputSchema={"type": "object", "properties": {}},
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="List Keys", read_only=True, destructive=False, idempotent=True, open_world=False),
             ),
             Tool(
                 name="keychain_set",
@@ -730,37 +1006,28 @@ async def list_tools() -> List[Tool]:
                         "value": {"type": "string", "description": "密钥值"}
                     },
                     "required": ["name", "value"]
-                }
+                },
+                outputSchema=JSON_SCHEMA_BASE,
+                annotations=tool_annotations(title="Store Key", read_only=False, destructive=False, idempotent=True, open_world=False),
             ),
         ])
-    
+
     return tools
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     """调用工具"""
-    
+
     try:
         registered_tool_names = {tool.name for tool in await list_tools()}
         if name not in registered_tool_names:
             return error_result(f"工具 '{name}' 未注册或不可用", tool=name)
 
-        project_manager, request_cwd, project_ctx = await get_request_project_context()
+        request_cwd = await get_request_cwd()
 
-        # ===== 项目上下文工具 =====
-        if name == "get_project_context":
-            return ok_result(
-                **project_ctx.to_dict(),
-                request_cwd=request_cwd,
-            )
-        
-        elif name == "list_project_memories":
-            projects = list_projects()
-            return ok_result(projects=projects, count=len(projects))
-        
         # ===== 基础工具 =====
-        elif name == "run_code":
+        if name == "run_code":
             code = arguments.get("code", "")
             code_type = arguments.get("code_type", "python")
             timeout = arguments.get("timeout", 60)
@@ -775,18 +1042,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 timed_out=result.get("timed_out", False),
                 stopped=result.get("stopped", False),
             )
-        
+
         # ===== Web 工具 =====
         elif name == "web_scan":
+            tabs_only = arguments.get("tabs_only", False)
+            switch_tab_id = arguments.get("switch_tab_id")
             text_only = arguments.get("text_only", False)
-            result = web_scan(text_only=text_only)
+            result = web_scan(tabs_only=tabs_only, switch_tab_id=switch_tab_id, text_only=text_only)
             return ok_result(**result)
-        
+
         elif name == "web_execute_js":
             script = arguments.get("script", "")
-            result = web_execute_js(script)
+            save_to_file = arguments.get("save_to_file", "")
+            switch_tab_id = arguments.get("switch_tab_id")
+            no_monitor = arguments.get("no_monitor", False)
+            result = web_execute_js(script, switch_tab_id=switch_tab_id, no_monitor=no_monitor)
+            if save_to_file and "js_return" in result:
+                content = str(result["js_return"] or '')
+                abs_path = resolve_workspace_path(save_to_file, request_cwd)
+                result["js_return"] = content[:170] + f"\n\n[已保存完整内容到 {abs_path}]"
+                try:
+                    abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(abs_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                except Exception as e:
+                    result["js_return"] += f"\n\n[保存失败: {e}]"
             return ok_result(**result)
-        
+
         # ===== 交互工具 =====
         elif name == "ask_user":
             question = arguments.get("question", "")
@@ -799,7 +1081,39 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 "candidates": candidates,
                 "interaction": "elicitation_required",
             }
-        
+
+        # ===== 文件工具（对齐 ga.py） =====
+        elif name == "read_file":
+            path = resolve_workspace_path(arguments.get("path", ""), request_cwd)
+            content = ga_file_read(
+                str(path),
+                start=arguments.get("start", 1),
+                keyword=arguments.get("keyword"),
+                count=arguments.get("count", 200),
+                show_linenos=arguments.get("show_linenos", True),
+            )
+            tips = ""
+            lowered = str(path).lower()
+            if "memory" in lowered or "sop" in lowered:
+                tips = "正在读取记忆或 SOP 文件；若按 SOP 执行，请提取关键点并调用 update_working_checkpoint。"
+            return ok_result(path=str(path), content=content, tips=tips)
+
+        elif name == "patch_file":
+            path = resolve_workspace_path(arguments.get("path", ""), request_cwd)
+            new_content = expand_file_refs(arguments.get("new_content", ""), base_dir=request_cwd)
+            result = ga_file_patch(
+                str(path),
+                arguments.get("old_content", ""),
+                new_content,
+            )
+            return ok_result(**result, path=str(path))
+
+        elif name == "write_file":
+            path = resolve_workspace_path(arguments.get("path", ""), request_cwd)
+            content = expand_file_refs(arguments.get("content", ""), base_dir=request_cwd)
+            result = write_file_content(path, content, mode=arguments.get("mode", "overwrite"))
+            return ok_result(**result)
+
         # ===== 截图工具 =====
         elif name == "screenshot":
             base64_img = screenshot_to_base64()
@@ -813,17 +1127,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 ],
                 structured,
             )
-        
+
         # ===== 窗口管理工具 =====
         elif name == "list_windows":
             windows = get_window_list()
             return ok_result(windows=windows, count=len(windows))
-        
+
         elif name == "activate_window":
             hwnd = arguments.get("hwnd", 0)
             result = activate_window(hwnd)
             return ok_result(message=result.get("msg"), hwnd=hwnd)
-        
+
         # ===== OCR 工具 =====
         elif name == "ocr_screen":
             if not OCR_AVAILABLE:
@@ -831,7 +1145,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             enhance = arguments.get("enhance", False)
             result = ocr_screen(enhance=enhance)
             return ok_result(**result)
-        
+
         # ===== ADB 工具 =====
         elif name == "adb_ui":
             if not ADB_AVAILABLE:
@@ -840,7 +1154,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             clickable_only = arguments.get("clickable_only", False)
             nodes = adb_ui(keyword=keyword, clickable_only=clickable_only, raw=True)
             return ok_result(nodes_count=len(nodes), nodes=nodes)
-        
+
         elif name == "adb_tap":
             if not ADB_AVAILABLE:
                 return error_result("ADB 功能不可用", capability="adb")
@@ -848,7 +1162,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             y = arguments.get("y", 0)
             adb_tap(x, y)
             return ok_result(message=f"已点击坐标 ({x}, {y})", x=x, y=y)
-        
+
         # ===== 系统控制工具 =====
         elif name == "mouse_click":
             if not SYSCTL_AVAILABLE:
@@ -862,14 +1176,14 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             else:
                 MouseClick()
             return ok_result(message=f"已在 ({x}, {y}) {'双击' if double else '单击'}", x=x, y=y, double=double)
-        
+
         elif name == "key_press":
             if not SYSCTL_AVAILABLE:
                 return error_result("系统控制功能不可用", capability="sysctl")
             keys_str = arguments.get("keys", "")
             Press(keys_str)
             return ok_result(message=f"已按键: {keys_str}", keys=keys_str)
-        
+
         elif name == "move_mouse":
             if not SYSCTL_AVAILABLE:
                 return error_result("系统控制功能不可用", capability="sysctl")
@@ -877,7 +1191,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             y = arguments.get("y", 0)
             SetCursorPos((x, y))
             return ok_result(message=f"鼠标已移动到 ({x}, {y})", x=x, y=y)
-        
+
         # ===== UI 检测工具 =====
         elif name == "detect_ui":
             if not UI_DETECT_AVAILABLE:
@@ -886,7 +1200,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             conf_threshold = arguments.get("conf_threshold", 0.25)
             detections = detect_ui_elements(image_path, conf_threshold=conf_threshold)
             return ok_result(detections_count=len(detections), detections=detections)
-        
+
         # ===== 进程内存扫描工具 =====
         elif name == "scan_process_memory":
             if not PROCMEM_AVAILABLE:
@@ -896,7 +1210,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             mode = arguments.get("mode", "auto")
             results = scan_memory(pid, pattern, mode=mode)
             return ok_result(matches_count=len(results), matches=results[:50])
-        
+
         # ===== 技能搜索工具 =====
         elif name == "skill_search":
             if not SKILL_SEARCH_AVAILABLE:
@@ -918,12 +1232,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                     "warnings": r.warnings
                 })
             return ok_result(results_count=len(results_dict), results=results_dict)
-        
+
         # ===== SOP/Skill 管理工具 =====
         elif name == "list_sops":
             sops = get_all_sops()
             return ok_result(sops_count=len(sops), sops=sops)
-        
+
         elif name == "read_sop":
             sop_name = arguments.get("name", "")
             sop_path = os.path.join(SOP_DIR, f"{sop_name}_sop.md")
@@ -941,7 +1255,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 )
             except Exception as e:
                 return error_result(str(e), name=sop_name)
-        
+
         elif name == "execute_sop":
             sop_name = arguments.get("name", "")
             params = arguments.get("params", {})
@@ -960,81 +1274,73 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 )
             except Exception as e:
                 return error_result(str(e), name=sop_name)
-        
-        # ===== 项目隔离的记忆工具 =====
+
+        elif name == "update_working_checkpoint":
+            if "key_info" in arguments:
+                WORKING_CHECKPOINT["key_info"] = arguments.get("key_info", "")
+            if "related_sop" in arguments:
+                WORKING_CHECKPOINT["related_sop"] = arguments.get("related_sop", "")
+            return ok_result(message="工作记忆检查点已更新", checkpoint=dict(WORKING_CHECKPOINT))
+
+        elif name == "start_long_term_update":
+            sop = load_memory_management_sop()
+            return ok_result(
+                message="已加载长期记忆整理 SOP；请只写行动验证成功且长期有效的信息，优先使用 write_memory patch 最小修改。",
+                content=sop,
+                memory_model="original_four_level",
+                default_write_mode="patch",
+            )
+
+        # ===== 原项目四级记忆工具 =====
         elif name == "read_memory":
-            memory_type = arguments.get("memory_type", "global_mem")
-            scope = arguments.get("scope", "auto")
-            result = project_manager.read_memory(memory_type, scope, cwd=request_cwd)
+            memory_type = arguments.get("memory_type", "all")
+            result = read_original_memory(memory_type)
             return ok_result(**result)
-        
+
         elif name == "write_memory":
             memory_type = arguments.get("memory_type", "global_mem")
             content = arguments.get("content", "")
-            scope = arguments.get("scope", "project")
-            mode = arguments.get("mode", "append")
-            result = project_manager.write_memory(memory_type, content, scope, cwd=request_cwd, mode=mode)
+            mode = arguments.get("mode", "patch")
+            result = write_original_memory(
+                memory_type,
+                content=content,
+                mode=mode,
+                old_content=arguments.get("old_content", ""),
+                new_content=arguments.get("new_content", ""),
+                target_path=arguments.get("target_path", ""),
+            )
             return ok_result(message="记忆写入完成", **result)
-        
-        # ===== 调度器任务管理工具（项目隔离） =====
+
+        # ===== 调度器任务管理工具 =====
         elif name == "list_scheduler_tasks":
-            include_global = arguments.get("include_global", False)
-            
+            scheduler_dir = original_memory_paths()["scheduler"]
             all_tasks = []
-            
-            # 读取项目级任务
-            if project_ctx.project_id != "global":
-                project_scheduler_dir = project_manager.get_memory_path("scheduler", scope="project", cwd=request_cwd)
-                if project_scheduler_dir.exists():
-                    for f in project_scheduler_dir.iterdir():
-                        if f.suffix == '.json':
-                            with open(f, 'r', encoding='utf-8') as fp:
-                                task = json.load(fp)
-                            all_tasks.append({"id": f.stem, "scope": "project", **task})
-            
-            # 读取全局任务
-            if include_global:
-                global_scheduler_dir = project_manager.get_memory_path("scheduler", scope="global", cwd=request_cwd)
-                if global_scheduler_dir.exists():
-                    for f in global_scheduler_dir.iterdir():
-                        if f.suffix == '.json':
-                            with open(f, 'r', encoding='utf-8') as fp:
-                                task = json.load(fp)
-                            all_tasks.append({"id": f.stem, "scope": "global", **task})
-            
+            if scheduler_dir.exists():
+                for f in scheduler_dir.iterdir():
+                    if f.suffix == '.json':
+                        with open(f, 'r', encoding='utf-8') as fp:
+                            task = json.load(fp)
+                        all_tasks.append({"id": f.stem, **task})
             return ok_result(tasks_count=len(all_tasks), tasks=all_tasks)
-        
+
         elif name == "read_scheduler_task":
             task_id = arguments.get("task_id", "")
-            scope = arguments.get("scope", "auto")
-            
-            # 确定查找范围
-            if scope == "auto":
-                scopes = ["project", "global"]
-            else:
-                scopes = [scope]
-            
-            for s in scopes:
-                scheduler_dir = project_manager.get_memory_path("scheduler", scope=s, cwd=request_cwd)
-                task_path = resolve_scheduler_task_path(scheduler_dir, task_id)
-                if task_path.exists():
-                    with open(task_path, 'r', encoding='utf-8') as f:
-                        task = json.load(f)
-                    return ok_result(scope=s, task=task)
-            
+            scheduler_dir = original_memory_paths()["scheduler"]
+            task_path = resolve_scheduler_task_path(scheduler_dir, task_id)
+            if task_path.exists():
+                with open(task_path, 'r', encoding='utf-8') as f:
+                    task = json.load(f)
+                return ok_result(task=task)
             return error_result(f"任务 '{task_id}' 不存在", task_id=task_id)
-        
+
         elif name == "create_scheduler_task":
             task_id = arguments.get("task_id", "")
             prompt = arguments.get("prompt", "")
             schedule = arguments.get("schedule", "08:00")
             repeat = arguments.get("repeat", "daily")
             enabled = arguments.get("enabled", True)
-            scope = arguments.get("scope", "project")
-            
-            scheduler_dir = project_manager.get_memory_path("scheduler", scope=scope, cwd=request_cwd)
+            scheduler_dir = original_memory_paths()["scheduler"]
             scheduler_dir.mkdir(parents=True, exist_ok=True)
-            
             task = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -1042,20 +1348,18 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 "enabled": enabled,
                 "max_delay_hours": 6
             }
-            
             task_path = resolve_scheduler_task_path(scheduler_dir, task_id)
             with open(task_path, 'w', encoding='utf-8') as f:
                 json.dump(task, f, ensure_ascii=False, indent=2)
-            
-            return ok_result(scope=scope, message=f"任务 '{task_id}' 已创建", task_id=task_id, task=task)
-        
+            return ok_result(message=f"任务 '{task_id}' 已创建", task_id=task_id, task=task)
+
         # ===== 密钥管理工具 =====
         elif name == "keychain_list":
             if not KEYCHAIN_AVAILABLE:
                 return error_result("密钥管理功能不可用", capability="keychain")
             key_list = keys.ls()
             return ok_result(keys=key_list)
-        
+
         elif name == "keychain_set":
             if not KEYCHAIN_AVAILABLE:
                 return error_result("密钥管理功能不可用", capability="keychain")
@@ -1063,10 +1367,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             value = arguments.get("value", "")
             keys.set(key_name, value)
             return ok_result(message=f"密钥 '{key_name}' 已存储", name=key_name)
-        
+
         else:
             return error_result(f"未知工具: {name}", tool=name)
-            
+
     except Exception as e:
         import traceback
         return error_result(f"执行错误: {str(e)}", traceback=traceback.format_exc())
@@ -1090,17 +1394,12 @@ async def app_lifespan(server_instance: Server):
         capabilities.append("SKILL")
     if KEYCHAIN_AVAILABLE:
         capabilities.append("KEYS")
-    
-    # 初始化项目上下文管理器
-    project_manager = ProjectContextManager()
-    ctx = project_manager.detect_project()
-    
+
     cap_str = f" [{', '.join(capabilities)}]" if capabilities else ""
     print(f"[GenericAgent Tools] 启动成功{cap_str} - 使用 Trae 自带模型驱动", file=sys.stderr)
-    print(f"[Project Context] 当前项目: {ctx.project_name} ({ctx.project_id}) [{ctx.project_type}]", file=sys.stderr)
-    
-    yield AppContext(project_manager=project_manager)
-    
+
+    yield AppContext()
+
     print("[GenericAgent Tools] 关闭", file=sys.stderr)
 
 
@@ -1108,7 +1407,7 @@ async def main():
     """主入口"""
     from mcp.server.stdio import stdio_server as create_stdio_server
     from mcp.server import NotificationOptions
-    
+
     async with create_stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,

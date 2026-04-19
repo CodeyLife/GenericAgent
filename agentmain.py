@@ -77,13 +77,13 @@ class GeneraticAgent:
         self.llmclient = self.llmclients[self.llm_no]
         self.llmclient.backend.history = lastc.backend.history
         self.llmclient.last_tools = ''
-        name = self.get_llm_name().lower()
+        name = self.get_llm_name()
         if 'glm' in name or 'minimax' in name or 'kimi' in name: load_tool_schema('_cn')
         else: load_tool_schema()
-    def list_llms(self): return [(i, self.get_llm_name(b), i == self.llm_no) for i, b in enumerate(self.llmclients)]
-    def get_llm_name(self, b=None):
-        b = self.llmclient if b is None else b
-        return f"{type(b.backend).__name__}/{b.backend.name}" if not isinstance(b, dict) else "BADCONFIG_MIXIN"
+    def list_llms(self): return [(i, f"{type(b.backend).__name__}/{b.backend.name}", i == self.llm_no) for i, b in enumerate(self.llmclients)]
+    def get_llm_name(self):
+        b = self.llmclient
+        return f"{type(b.backend).__name__}/{b.backend.name}"
 
     def abort(self):
         if not self.is_running: return
@@ -109,7 +109,7 @@ class GeneraticAgent:
             display_queue.put({'done': smart_format(f"✅ session.{k} = {repr(v)}", max_str_len=500), 'source': 'system'})
             return None
         if raw_query.strip() == '/resume':
-            return r'用re.findall(r"<history>\\n\[(?:USER\|Agent)\].*?</history>", content, re.DOTALL) 扫temp/model_responses/下各文件(除本PID)，取每文件最后一个匹配(注意JSON里换行是字面\\n)作为该会话内容，按mtime倒序，每个用一句话总结聊了什么让我选择；选定后再简单读该文件末尾作为聊天基础'
+            return '简单看看model_responses中的最近几次对话结尾部分(除了本次)，分别简单总结一下让我选择，然后你简单阅读了解情况后作为我们接下来聊天的基础'
         return raw_query
 
     def run(self):

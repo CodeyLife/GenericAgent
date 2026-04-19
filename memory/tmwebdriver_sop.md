@@ -1,8 +1,9 @@
 # TMWebDriver SOP
 
-- 直接用web_scan/web_execute_js工具。本文件只记录特性和坑。
-- 底层：`../TMWebDriver.py`通过Chrome扩展接管用户浏览器（保留登录态/Cookie）
+- 禁止import，直接用web_scan/web_execute_js工具。本文件只记录特性和坑。
+- 底层：`../TMWebDriver.py`通过Chrome扩展(非Tampermonkey)接管用户浏览器（保留登录态/Cookie）
 - 非Selenium/Playwright，保留用户浏览器登录态
+- ⚠扩展更新后旧tab的content script不重载→需刷新页面
 
 ## 通用特性
 - ⚠web_execute_js里使用`await`时需**显式`return`**才能拿到返回值（底层async包裹，不写return则返回null）
@@ -111,11 +112,11 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 - simphtml调试必须通过`code_run`注入JS到真实浏览器（Python端无法模拟DOM）
 - `d=TMWebDriver()`, `d.set_session('url_pattern')`, `d.execute_js(code)` → 返回`{'data': value}`
 - simphtml：`str(simphtml.optimize_html_for_tokens(html))` — 返回BS4 Tag需str()
+- ⚠**DOMRect坑(hasOverlap)**：某些上下文`rect.x/y`为undefined(只有left/top)，导致NaN→误判重叠。兼容：`rect.x ?? rect.left`
 
 ## 连不上排查
-web_scan失败时按序排查（自动检测优先，用户参与放最后）：
-①浏览器没开？→检查浏览器进程是否在跑(tasklist/ps)，没有则启动并打开正常URL（⚠about:blank等内部页不加载扩展）
-②WS后台挂了？→本机18766端口没监听即dead→手动后台`from TMWebDriver import TMWebDriver; TMWebDriver()`起master
-③扩展没装？→读Chrome用户目录下`Secure Preferences`→`extensions.settings`中找`path`含`tmwd_cdp_bridge`的条目
-  找到→扩展已装，排查其他原因；没找到→走web_setup_sop
-④以上都正常仍连不上→请求用户协助
+web_scan失败时按序排查：
+①扩展没装？→检查Chrome扩展列表(chrome://extensions)是否有TMWebDriver扩展
+  没找到→走web_setup_sop；找到→确认已启用
+②浏览器没开？→检查①对应的浏览器进程是否在跑(tasklist/ps)，没有则启动并打开正常URL（⚠about:blank等内部页不加载扩展）
+③WS后台挂了？→socket.connect_ex(('127.0.0.1',18766))非0即dead→手动`from TMWebDriver import TMWebDriver; TMWebDriver()`起master

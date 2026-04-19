@@ -1,6 +1,7 @@
-import sys, os, re, json, time, threading, importlib
+import sys, os, re, json, time, threading, importlib, io
 from datetime import datetime
 from pathlib import Path
+from contextlib import nullcontext, redirect_stdout
 import tempfile, traceback, subprocess, itertools, collections, difflib
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 if sys.stderr is None: sys.stderr = open(os.devnull, "w")
@@ -8,19 +9,25 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent_loop import BaseHandler, StepOutcome, json_default
 
-def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=[]):
-    """代码执行器
-    python: 运行复杂的 .py 脚本（文件模式）
-    powershell/bash: 运行单行指令（命令模式）
-    优先使用python，仅在必要系统操作时使用powershell"""
-    preview = (code[:60].replace('\n', ' ') + '...') if len(code) > 60 else code.strip()
-    yield f"[Action] Running {code_type} in {os.path.basename(cwd)}: {preview}\n"
+def execute_code(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None, quiet=False):
+    """执行代码并返回结构化结果。
+
+    `quiet=True` 时抑制 helper 调试输出，适合 MCP/stdIO 场景。
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cwd = cwd or os.path.join(script_dir, 'temp'); tmp_path = None
+    cwd = cwd or os.path.join(script_dir, 'temp')
+    os.makedirs(cwd, exist_ok=True)
+    if stop_signal is None:
+        stop_signal = []
+    preview = (code[:60].replace('\n', ' ') + '...') if len(code) > 60 else code.strip()
+    transcript_parts = [f"[Action] Running {code_type} in {os.path.basename(cwd)}: {preview}\n"]
+    tmp_path = None
     if code_type == "python":
         tmp_file = tempfile.NamedTemporaryFile(suffix=".ai.py", delete=False, mode='w', encoding='utf-8', dir=code_cwd)
         cr_header = os.path.join(script_dir, 'assets', 'code_run_header.py')
-        if os.path.exists(cr_header): tmp_file.write(open(cr_header, encoding='utf-8').read())
+        if os.path.exists(cr_header):
+            with open(cr_header, encoding='utf-8') as header_fp:
+                tmp_file.write(header_fp.read())
         tmp_file.write(code)
         tmp_path = tmp_file.name
         tmp_file.close()
@@ -30,7 +37,6 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         else: cmd = ["bash", "-c", code]
     else:
         return {"status": "error", "msg": f"不支持的类型: {code_type}"}
-    print("code run output:") 
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
@@ -44,25 +50,38 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
                 try: line = line_bytes.decode('utf-8')
                 except UnicodeDecodeError: line = line_bytes.decode('gbk', errors='ignore')
                 logs.append(line)
-                try: print(line, end="") 
+                try:
+                    if not quiet: print(line, end="")
                 except: pass
         except: pass
 
     try:
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0, cwd=cwd, startupinfo=startupinfo
-        )
+        stdout_guard = redirect_stdout(io.StringIO()) if quiet else nullcontext()
+        with stdout_guard:
+            if not quiet:
+                print("code run output:")
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=0, cwd=cwd, startupinfo=startupinfo
+            )
         start_t = time.time()
         t = threading.Thread(target=stream_reader, args=(process, full_stdout), daemon=True)
         t.start()
 
-        while t.is_alive():
-            istimeout = time.time() - start_t > timeout
-            if istimeout or len(stop_signal) > 0:
+        timed_out = False
+        stopped = False
+        while process.poll() is None:
+            timed_out = time.time() - start_t > timeout
+            stopped = len(stop_signal) > 0
+            if timed_out or stopped:
                 process.kill()
-                print("[Debug] Process killed due to timeout or stop signal.")
-                if istimeout: full_stdout.append("\n[Timeout Error] 超时强制终止")
+                try:
+                    process.wait(timeout=1)
+                except Exception:
+                    pass
+                if not quiet:
+                    print("[Debug] Process killed due to timeout or stop signal.")
+                if timed_out: full_stdout.append("\n[Timeout Error] 超时强制终止")
                 else: full_stdout.append("\n[Stopped] 用户强制终止")
                 break
             time.sleep(1)
@@ -75,18 +94,47 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         status_icon = "✅" if exit_code == 0 else "❌"
         if exit_code is None: status_icon = "⏳" 
         output_snippet = smart_format(stdout_str, max_str_len=600, omit_str='\n\n[omitted long output]\n\n')
-        yield f"[Status] {status_icon} Exit Code: {exit_code}\n[Stdout]\n{output_snippet}\n"
+        transcript_parts.append(f"[Status] {status_icon} Exit Code: {exit_code}\n[Stdout]\n{output_snippet}\n")
         if process.stdout: threading.Thread(target=process.stdout.close, daemon=True).start()
         return {
             "status": status,
             "stdout": smart_format(stdout_str, max_str_len=10000, omit_str='\n\n[omitted long output]\n\n'),
-            "exit_code": exit_code
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stopped": stopped,
+            "transcript": "".join(transcript_parts),
         }
     except Exception as e:
         if 'process' in locals(): process.kill()
-        return {"status": "error", "msg": str(e)}
+        return {
+            "status": "error",
+            "msg": str(e),
+            "exit_code": None,
+            "timed_out": False,
+            "stopped": False,
+            "stdout": "",
+            "transcript": "".join(transcript_parts),
+        }
     finally:
         if code_type == "python" and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+
+
+def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=[]):
+    """代码执行器
+    python: 运行复杂的 .py 脚本（文件模式）
+    powershell/bash: 运行单行指令（命令模式）
+    优先使用python，仅在必要系统操作时使用powershell"""
+    result = execute_code(code, code_type=code_type, timeout=timeout, cwd=cwd, code_cwd=code_cwd, stop_signal=stop_signal, quiet=False)
+    transcript = result.get("transcript", "")
+    status_marker = "\n[Status]"
+    if status_marker in transcript:
+        action_part, status_part = transcript.split(status_marker, 1)
+        if action_part:
+            yield action_part
+        yield status_marker + status_part
+    elif transcript:
+        yield transcript
+    return result
 
 
 def ask_user(question, candidates=None):

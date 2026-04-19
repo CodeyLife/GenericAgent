@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "genericagent": {
+      "command": "python",
+      "args": [
+        "F:\\GitHubProject\\GenericAgent\\mcp_server.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "description": "GenericAgent MCP Server - 自主任务执行、文件操作、代码运行、网页浏览"
+    }
+  }
+}

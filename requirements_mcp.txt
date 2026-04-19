@@ -1,0 +1,10 @@
+# MCP 依赖
+mcp>=1.0.0
+
+# GenericAgent 原有依赖
+streamlit
+pywebview
+requests
+Pillow
+pyautogui
+pynput

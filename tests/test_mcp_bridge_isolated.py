@@ -113,7 +113,20 @@ class TestMcpBridgeIsolated(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read_memory_tool.inputSchema["properties"]["memory_type"]["default"], "all")
         tool_names = {t.name for t in tools}
         self.assertFalse(any(t.name in {"get_project_context", "list_project_memories"} for t in tools))
-        self.assertTrue({"read_file", "patch_file", "write_file", "update_working_checkpoint", "start_long_term_update"}.issubset(tool_names))
+        self.assertTrue({"read_file", "patch_file", "write_file", "start_long_term_update"}.issubset(tool_names))
+        self.assertNotIn("update_working_checkpoint", tool_names)
+        self.assertTrue(
+            {
+                "ga_begin_task",
+                "ga_get_context",
+                "ga_update_working_checkpoint",
+                "ga_end_turn",
+                "ga_enter_plan_mode",
+                "ga_get_plan_status",
+                "ga_install_rules",
+                "ga_get_scheduler_due",
+            }.issubset(tool_names)
+        )
 
     def _temp_original_memory_paths(self, tmpdir):
         root = bridge.Path(tmpdir)
@@ -150,7 +163,7 @@ class TestMcpBridgeIsolated(unittest.IsolatedAsyncioTestCase):
             with open(target, encoding="utf-8") as f:
                 self.assertIn("hello MCP", f.read())
 
-    async def test_working_and_long_term_memory_workflow_tools(self):
+    async def test_long_term_memory_workflow_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sop_dir = os.path.join(tmpdir, "memory")
             os.makedirs(sop_dir, exist_ok=True)
@@ -159,17 +172,99 @@ class TestMcpBridgeIsolated(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(bridge, "SOP_DIR", sop_dir), \
                  patch.object(bridge, "get_request_cwd", self._fake_request_cwd):
-                checkpoint = await bridge.call_tool(
-                    "update_working_checkpoint",
-                    {"key_info": "重要约束", "related_sop": "memory_management_sop"},
-                )
                 long_term = await bridge.call_tool("start_long_term_update", {})
 
-            self.assertEqual(checkpoint["status"], "success")
-            self.assertEqual(checkpoint["checkpoint"]["key_info"], "重要约束")
             self.assertEqual(long_term["status"], "success")
             self.assertIn("No Execution, No Memory", long_term["content"])
             self.assertEqual(long_term["default_write_mode"], "patch")
+
+    async def test_ga_lifecycle_session_context_and_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def fake_cwd():
+                return tmpdir
+
+            with patch.object(bridge, "get_request_cwd", fake_cwd):
+                begin = await bridge.call_tool("ga_begin_task", {"task": "demo lifecycle"})
+                session_id = begin["session_id"]
+                checkpoint = await bridge.call_tool(
+                    "ga_update_working_checkpoint",
+                    {"session_id": session_id, "key_info": "关键约束", "related_sop": "plan_sop.md"},
+                )
+                context = await bridge.call_tool("ga_get_context", {"session_id": session_id, "include_global_memory": False})
+                end_turn = await bridge.call_tool(
+                    "ga_end_turn",
+                    {"session_id": session_id, "response_text": "没有 summary", "tool_calls": [{"tool_name": "read_file", "args": {"path": "x"}}]},
+                )
+                timeline = await bridge.call_tool("ga_get_session_timeline", {"session_id": session_id})
+
+            self.assertEqual(begin["authority_mode"], "trae_mcp_contract")
+            self.assertEqual(checkpoint["checkpoint"]["key_info"], "关键约束")
+            self.assertIn("关键约束", context["context"])
+            self.assertEqual(end_turn["turn"], 1)
+            self.assertTrue(any(w["code"] == "missing_summary" for w in end_turn["warnings"]))
+            self.assertGreaterEqual(timeline["events_count"], 3)
+
+    async def test_ga_plan_mode_status_and_blocked_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = os.path.join(tmpdir, "plan.md")
+            with open(plan, "w", encoding="utf-8") as f:
+                f.write("# Plan\n- [ ] do thing\n")
+
+            async def fake_cwd():
+                return tmpdir
+
+            with patch.object(bridge, "get_request_cwd", fake_cwd):
+                begin = await bridge.call_tool("ga_begin_task", {"task": "plan task"})
+                session_id = begin["session_id"]
+                entered = await bridge.call_tool("ga_enter_plan_mode", {"session_id": session_id, "plan_path": "plan.md"})
+                status = await bridge.call_tool("ga_get_plan_status", {"session_id": session_id})
+                blocked = await bridge.call_tool("ga_end_task", {"session_id": session_id, "final_summary": "done"})
+
+            self.assertEqual(entered["phase"], "planning")
+            self.assertEqual(status["plan_status"]["remaining_unchecked"], 1)
+            self.assertEqual(blocked["status"], "blocked")
+
+    async def test_ga_install_rules_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def fake_cwd():
+                return tmpdir
+
+            with patch.object(bridge, "get_request_cwd", fake_cwd):
+                first = await bridge.call_tool("ga_install_rules", {})
+                second = await bridge.call_tool("ga_install_rules", {})
+
+            self.assertIn(first["action"], {"created", "appended"})
+            self.assertEqual(second["action"], "updated")
+            rules_path = os.path.join(tmpdir, ".trae", "rules", "genericagent-mcp.md")
+            with open(rules_path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertEqual(content.count(bridge.GENERICAGENT_RULES_MARKER_START), 1)
+            self.assertIn("ga_begin_task", content)
+
+    async def test_ga_scheduler_due_is_notify_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._temp_original_memory_paths(tmpdir)
+            paths["scheduler"].mkdir(parents=True, exist_ok=True)
+            task = {
+                "prompt": "do scheduled thing",
+                "schedule": "00:00",
+                "repeat": "daily",
+                "enabled": True,
+                "max_delay_hours": 24,
+            }
+            (paths["scheduler"] / "daily_demo.json").write_text(
+                __import__("json").dumps(task, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(bridge, "original_memory_paths", lambda base_dir=None: paths), \
+                 patch.object(bridge, "get_request_cwd", self._fake_request_cwd):
+                due = await bridge.call_tool("ga_get_scheduler_due", {"now": "2026-04-19T01:00:00"})
+
+            self.assertEqual(due["due_count"], 1)
+            self.assertEqual(due["due_tasks"][0]["task_id"], "daily_demo")
+            self.assertEqual(due["due_tasks"][0]["execution_mode"], "notify_only_trae_must_execute")
+            self.assertIn("do scheduled thing", due["due_tasks"][0]["prompt"])
 
     async def test_write_memory_uses_original_global_l2_append_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:

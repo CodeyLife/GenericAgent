@@ -1,0 +1,39 @@
+## [exam_system_architecture]
+### 项目路径
+- Flutter 前端: d:\UnityProject\DiagnosticExamination\exam_system_flutter\
+- C# 后端: d:\UnityProject\DiagnosticExamination\backend\
+
+### 核心架构
+- SignalR 实时通信: lib/core/services/signalr_service.dart
+- 考试状态机: lib/core/utils/exam_state_machine.dart
+- 考试控制器: lib/presentation/controllers/exam_controller.dart
+- 运行时控制器: lib/presentation/controllers/exam_runtime_controller.dart
+- 案例服务: lib/data/services/case_service.dart
+- 案例目录控制器: lib/presentation/controllers/case_catalog_controller.dart
+
+### 案例缓存策略
+- CaseService._fullCaseCache: 内存缓存，避免重复读文件和解密
+- CaseCatalogController.caseDataCache: Controller 层缓存
+- 刷新时需同步清除两处缓存: CaseService.invalidateFullCaseCache() + caseDataCache.remove()
+
+### 关键修复记录
+1. SignalR disconnect() 必须重置 _handlersSetup、_reconnectDebounceTimer、_isManualReconnecting
+2. applyAuthoritativeStateSync() 超时记录使用 retainWhere() 保留活跃案例，而非 clear()
+3. 日志命名规范: Debug → _logger, MAX_RETRY_COUNT → maxRetryCount, print → _logger.e## [grxcad_plugin_development]
+### 项目路径
+- 项目根目录: d:\CsharpProject\CADProject2020\GrxCADGeometryPlugin
+- SDK 路径: d:\CsharpProject\CADProject2020\grxsdk
+
+### 技术栈
+- 目标框架: .NET Framework 4.8
+- 核心引用: gmdb.dll (数据库操作), gmap.dll (应用程序服务)
+- 命名空间: GrxCAD.Runtime, GrxCAD.ApplicationServices, GrxCAD.Geometry, GrxCAD.DatabaseServices
+
+### 已实现命令
+- 基础图形: DrawCircle, DrawArc, DrawEllipse
+- 复杂图形: DrawPolygon, DrawStar, DrawSpiral, DrawGear
+- 组合图形: DrawFlower, DrawMandala
+
+### 编译输出
+- 输出路径: GrxCADGeometryPlugin\bin\Debug\GrxCADGeometryPlugin.dll
+- 编译状态: 成功 (0错误, 2个x86架构警告)

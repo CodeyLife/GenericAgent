@@ -33,57 +33,6 @@ tasks/
 
 *.zip
 
-memory/*
-!memory/memory_management_sop.md
-
-# Allow tracking of specific SOPs
-!memory/web_setup_sop.md
-!memory/autonomous_operation_sop.md
-!memory/autonomous_operation_sop/
-!memory/autonomous_operation_sop/**
-!memory/scheduled_task_sop.md
-
-# L4 session archiver (only the script, not archives)
-!memory/L4_raw_sessions/
-memory/L4_raw_sessions/*
-!memory/L4_raw_sessions/compress_session.py
-
-# ljqCtrl related tools
-!memory/ljqCtrl.py
-!memory/ljqCtrl_sop.md
-
-# procmem_scanner related tools
-!memory/procmem_scanner.py
-!memory/procmem_scanner_sop.md
-
-# TMWebDriver SOP
-!memory/tmwebdriver_sop.md
-
-# Subagent SOP
-!memory/subagent_sop.md
-
-# Plan SOP
-!memory/plan_sop.md
-
-# Skill Search SOP
-!memory/skill_search/
-!memory/skill_search/**
-
-
-# ADB UI tool
-!memory/adb_ui.py
-
-# Keychain
-!memory/keychain.py
-
-# Vision / OCR / UI detection tools
-!memory/ocr_utils.py
-!memory/vision_sop.md
-!memory/ui_detect.py
-
-# Memory management
-!memory/memory_cleanup_sop.md
-
 # Visual Studio
 .vs/
 restore_commit.txt

@@ -485,44 +485,48 @@ def patch_text_file(path: Path, old_content: str, new_content: str) -> Dict[str,
 def write_original_memory(
     memory_type: str,
     *,
-    content: str = "",
-    mode: str = "patch",
     old_content: str = "",
     new_content: str = "",
     target_path: str = "",
+    mode: str = "patch",
 ) -> Dict[str, Any]:
-    """按原项目保守记忆流程写入：默认使用唯一 patch；append 需显式指定。"""
-    if mode not in ("append", "patch"):
-        raise ValueError("原项目记忆流程不支持 overwrite；仅允许 append 或 patch")
-
+    """按原项目保守记忆流程写入：支持 patch 和 append 两种模式。
+    
+    - patch 模式：需要 old_content，执行唯一匹配替换
+    - append 模式：不需要 old_content，直接在文件末尾追加内容
+    """
     paths = original_memory_paths()
     mem_path = resolve_original_memory_write_path(memory_type, target_path)
     mem_path.parent.mkdir(parents=True, exist_ok=True)
 
     if mode == "append":
-        if memory_type not in ("global_mem", "todo", "history"):
-            raise ValueError("append 仅支持 global_mem/todo/history；L1/L3/L4 结构性修改请使用 patch")
-        stripped = content.strip()
-        if not stripped:
-            raise ValueError("content 不能为空")
-        existing = read_text_if_exists(mem_path)
-        combined = f"{existing}\n\n---\n\n{stripped}" if existing else stripped
-        with open(mem_path, "w", encoding="utf-8") as f:
-            f.write(combined)
-        detail = {"appended_bytes": len(stripped)}
+        # append 模式：直接在文件末尾追加
+        with open(mem_path, "a", encoding="utf-8") as f:
+            f.write(new_content)
+        detail = {"appended_bytes": len(new_content)}
+        return {
+            "status": "success",
+            "memory_model": "original_four_level",
+            "path": str(mem_path),
+            "memory_type": memory_type,
+            "mode": "append",
+            "sop": str(paths["memory_management_sop"]),
+            "note": "已按 append 模式追加内容到记忆文件末尾。",
+            **detail,
+        }
     else:
+        # patch 模式：需要 old_content，执行唯一匹配替换
         detail = patch_text_file(mem_path, old_content, new_content)
-
-    return {
-        "status": "success",
-        "memory_model": "original_four_level",
-        "path": str(mem_path),
-        "memory_type": memory_type,
-        "mode": mode,
-        "sop": str(paths["memory_management_sop"]),
-        "note": "已按原项目记忆流程写入；L1/L3 同步应继续遵循 memory_management_sop 的最小 patch 原则。",
-        **detail,
-    }
+        return {
+            "status": "success",
+            "memory_model": "original_four_level",
+            "path": str(mem_path),
+            "memory_type": memory_type,
+            "mode": "patch",
+            "sop": str(paths["memory_management_sop"]),
+            "note": "已按原项目记忆流程写入；仅支持 patch 模式，L1/L3/L4 结构性修改请遵循 memory_management_sop 的最小 patch 原则。",
+            **detail,
+        }
 
 def utc_now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -721,6 +725,10 @@ def genericagent_rules_block() -> str:
     return f"""{GENERICAGENT_RULES_MARKER_START}
 # GenericAgent MCP Protocol
 
+## 核心原则：MCP 不自动注入工作记忆，必须手动刷新
+本 MCP 桥接没有自动循环引擎，每轮执行工具后不会自动注入工作记忆上下文（history/key_info/related_sop）。
+**必须**通过 lifecycle 工具手动刷新，否则模型可能丢失任务上下文导致推理断链。
+
 ## 任务开始时
 1. 调用 `ga_begin_task` 创建 session
 2. 调用 `ga_get_context` 获取工作记忆和全局记忆
@@ -740,8 +748,44 @@ def genericagent_rules_block() -> str:
 4. 执行时按 `[ ]` 逐项完成
 5. 完成前调用 `ga_get_plan_status` 确认 `can_complete=true`
 
-## 每轮结束后
-调用 `ga_end_turn` 并提供 `<summary>`
+## 每轮结束后的标准流程（必须遵守）
+**每次执行完破坏性/状态变更工具后**（run_code, write_file, patch_file, web_execute_js 等）：
+1. 调用 `ga_end_turn` 并提供 `<summary>` 标签总结本轮操作
+2. 调用 `ga_get_context` 刷新工作记忆和全局记忆
+3. 将 `recommended_next_prompt` 中的工作记忆纳入下一步推理
+
+**注意**：如果不执行此流程，模型将看不到：
+- 最近 20 条执行历史（history_info）
+- 任务关键约束（key_info）
+- 关联 SOP 提示（related_sop）
+- 全局记忆（L1/L2）
+这会导致推理断链，模型可能忘记之前设置的约束或重复执行相同操作。
+
+## 读取记忆/SOP 后的特殊流程
+**调用 `read_file` 读取 memory/ 或 SOP 文件后**：
+1. 提取文件中的关键约束、步骤、经验
+2. 调用 `ga_update_working_checkpoint` 将关键点记录到 working memory
+3. 然后才执行后续操作
+
+## write_memory 工具使用指南
+`write_memory` 工具支持两种模式：
+
+### patch 模式（默认）
+- 适用场景：修改已有记忆内容
+- 必须提供 `old_content`（要替换的原文本）和 `new_content`（替换后的新文本）
+- `old_content` 必须在记忆文件中存在且只出现一次
+- 使用前必须先调用 `read_memory` 确认当前记忆内容
+
+### append 模式
+- 适用场景：在记忆文件末尾追加新内容（如添加新的项目架构记录）
+- 只需提供 `new_content`（要追加的内容），不需要 `old_content`
+- 使用方式：`write_memory(memory_type="global_mem", new_content="...", mode="append")`
+- 追加的内容会自动添加到文件末尾，不会覆盖现有内容
+
+### 模式选择建议
+- 如果要修改已有内容 → 使用 patch 模式
+- 如果要添加全新内容（如新项目记录） → 使用 append 模式
+- 不确定时，先调用 `read_memory` 查看当前内容再决定
 
 {GENERICAGENT_RULES_MARKER_END}"""
 
@@ -1186,17 +1230,17 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="write_memory",
-            description="按原 GenericAgent 记忆流程写入：默认使用唯一 patch；append 需显式指定；不支持 overwrite",
+            description="按原 GenericAgent 记忆流程写入：支持 patch 和 append 两种模式。patch 模式需要 old_content 执行唯一匹配替换；append 模式直接在文件末尾追加内容。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "memory_type": {"type": "string", "enum": ["global_mem_insight", "global_mem", "todo", "history", "memory_management_sop", "l3_file"], "default": "global_mem"},
-                    "content": {"type": "string", "description": "append 模式追加的记忆内容"},
-                    "mode": {"type": "string", "enum": ["patch", "append"], "default": "patch", "description": "patch=唯一 old_content 替换（默认，符合原项目最小修改流程）；append=追加到 L2/todo/history"},
-                    "old_content": {"type": "string", "description": "patch 模式要替换的唯一旧文本"},
-                    "new_content": {"type": "string", "description": "patch 模式替换后的新文本"},
-                    "target_path": {"type": "string", "description": "memory_type=l3_file 时，memory/ 内的相对路径"}
-                }
+                    "old_content": {"type": "string", "description": "要替换的唯一旧文本（patch 模式时必须存在且只出现一次）"},
+                    "new_content": {"type": "string", "description": "替换后的新文本或要追加的内容"},
+                    "target_path": {"type": "string", "description": "memory_type=l3_file 时，memory/ 内的相对路径"},
+                    "mode": {"type": "string", "enum": ["patch", "append"], "default": "patch", "description": "写入模式：patch 为替换模式，append 为追加模式"}
+                },
+                "required": ["new_content"]
             },
             outputSchema=JSON_SCHEMA_BASE,
             annotations=tool_annotations(title="Write Memory", read_only=False, destructive=False, idempotent=False, open_world=False),
@@ -1677,6 +1721,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 stdout=result.get("stdout", ""),
                 timed_out=result.get("timed_out", False),
                 stopped=result.get("stopped", False),
+                recommended_next_tool="ga_end_turn",
             )
 
         # ===== Web 工具 =====
@@ -1703,20 +1748,87 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                         f.write(content)
                 except Exception as e:
                     result["js_return"] += f"\n\n[保存失败: {e}]"
+            result["recommended_next_tool"] = "ga_end_turn"
             return ok_result(**result)
 
         # ===== 交互工具 =====
         elif name == "ask_user":
             question = arguments.get("question", "")
             candidates = arguments.get("candidates", [])
-            _ = ask_user(question, candidates)
-            return {
-                "status": "awaiting_user_input",
-                "message": "需要用户输入。MCP 客户端应暂停自动执行并向用户展示该问题。",
-                "question": question,
-                "candidates": candidates,
-                "interaction": "elicitation_required",
-            }
+            if not question:
+                return error_result("ask_user 需要提供 question 参数")
+
+            request_ctx = server.request_context
+            session = request_ctx.session
+            related_request_id = request_ctx.request.id if request_ctx.request else None
+
+            # 构建 elicitation schema
+            if candidates:
+                # 有候选项：使用 enum 让用户选择
+                requested_schema = {
+                    "type": "object",
+                    "properties": {
+                        "selection": {
+                            "type": "string",
+                            "enum": candidates,
+                            "description": question,
+                        }
+                    },
+                    "required": ["selection"],
+                }
+            else:
+                # 无候选项：自由文本输入
+                requested_schema = {
+                    "type": "object",
+                    "properties": {
+                        "response": {
+                            "type": "string",
+                            "description": question,
+                        }
+                    },
+                    "required": ["response"],
+                }
+
+            # 发送 elicitation 请求，等待用户响应
+            elicitation_result = await session.elicit_form(
+                message=question,
+                requestedSchema=requested_schema,
+                related_request_id=related_request_id,
+            )
+
+            # 处理用户响应
+            action = getattr(elicitation_result, 'action', 'unknown')
+            content = getattr(elicitation_result, 'content', {})
+
+            if action == "accept" and content:
+                # 提取用户选择的值
+                if candidates:
+                    selected = content.get("selection", "")
+                else:
+                    selected = content.get("response", "")
+                return ok_result(
+                    status="user_responded",
+                    message="用户已响应",
+                    question=question,
+                    user_response=selected,
+                    candidates=candidates if candidates else None,
+                    interaction="elicitation_complete",
+                )
+            elif action == "decline":
+                return ok_result(
+                    status="user_declined",
+                    message="用户拒绝响应",
+                    question=question,
+                    interaction="elicitation_declined",
+                )
+            else:
+                return ok_result(
+                    status="elicitation_cancelled",
+                    message="elicitation 被取消",
+                    question=question,
+                    action=action,
+                    interaction="elicitation_cancelled",
+                )
 
         # ===== 文件工具（对齐 ga.py） =====
         elif name == "read_file":
@@ -1732,7 +1844,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             lowered = str(path).lower()
             if "memory" in lowered or "sop" in lowered:
                 tips = "正在读取记忆或 SOP 文件；若按 SOP 执行，请提取关键点并在已有 session 中调用 ga_update_working_checkpoint。"
-            return ok_result(path=str(path), content=content, tips=tips)
+            is_memory_sop = "memory" in lowered or "sop" in lowered
+            return ok_result(
+                path=str(path), content=content, tips=tips,
+                recommended_next_tool="ga_update_working_checkpoint" if is_memory_sop else "ga_end_turn",
+            )
 
         elif name == "patch_file":
             path = resolve_workspace_path(arguments.get("path", ""), request_cwd)
@@ -1742,13 +1858,13 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                 arguments.get("old_content", ""),
                 new_content,
             )
-            return ok_result(**result, path=str(path))
+            return ok_result(**result, path=str(path), recommended_next_tool="ga_end_turn")
 
         elif name == "write_file":
             path = resolve_workspace_path(arguments.get("path", ""), request_cwd)
             content = expand_file_refs(arguments.get("content", ""), base_dir=request_cwd)
             result = write_file_content(path, content, mode=arguments.get("mode", "overwrite"))
-            return ok_result(**result)
+            return ok_result(**result, recommended_next_tool="ga_end_turn")
 
         # ===== 截图工具 =====
         elif name == "screenshot":
@@ -1928,15 +2044,22 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
         elif name == "write_memory":
             memory_type = arguments.get("memory_type", "global_mem")
-            content = arguments.get("content", "")
+            old_content = arguments.get("old_content", "")
+            new_content = arguments.get("new_content", "")
+            target_path = arguments.get("target_path", "")
             mode = arguments.get("mode", "patch")
+            
+            if mode == "patch" and not old_content:
+                return error_result("write_memory patch 模式必须提供非空的 old_content")
+            if not new_content:
+                return error_result("write_memory 必须提供非空的 new_content")
+            
             result = write_original_memory(
                 memory_type,
-                content=content,
+                old_content=old_content,
+                new_content=new_content,
+                target_path=target_path,
                 mode=mode,
-                old_content=arguments.get("old_content", ""),
-                new_content=arguments.get("new_content", ""),
-                target_path=arguments.get("target_path", ""),
             )
             return ok_result(message="记忆写入完成", **result)
 

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "genericagent-mcp": {
+      "command": "python",
+      "args": [
+        "D:\\GithubProject\\GenericAgent\\mcp_bridge_isolated.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "description": "GenericAgent MCP Bridge - 计划模式、记忆管理、文件操作、代码执行、Web工具、系统控制"
+    }
+  }
+}
+ 

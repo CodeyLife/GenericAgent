@@ -1,0 +1,15 @@
+# Global Memory Insight
+
+## High Frequency Topics (Level 1)
+grxcad_plugin_development → [grxcad_plugin_development] in global_mem.txt
+exam_system_architecture → [exam_system_architecture] in global_mem.txt
+
+## Low Frequency Topics (Level 2)
+- grxcad_plugin
+- exam_system
+
+## RULES
+- No execution, no memory
+- Minimum sufficient pointer
+- No volatile state
+- Sanctity of verified data
